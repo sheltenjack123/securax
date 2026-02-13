@@ -2,12 +2,15 @@ import os
 import smtplib
 import socket
 import ssl
+import base64
 from datetime import datetime
 from email.message import EmailMessage
 import uuid
 import re
 import json
 from typing import Optional
+import urllib.request
+import urllib.error
 
 from flask import Flask, jsonify, request, send_from_directory, url_for
 
@@ -20,6 +23,10 @@ SMTP_PASSWORD = os.getenv("SMTP_PASSWORD", "")
 SMTP_HOST = os.getenv("SMTP_HOST", "smtp.gmail.com")
 SMTP_PORT = int(os.getenv("SMTP_PORT", "465"))
 SMTP_MODE = os.getenv("SMTP_MODE", "auto").strip().lower()
+EMAIL_PROVIDER = os.getenv("EMAIL_PROVIDER", "auto").strip().lower()
+RESEND_API_KEY = os.getenv("RESEND_API_KEY", "").strip()
+RESEND_FROM = os.getenv("RESEND_FROM", "").strip()
+RESEND_API_URL = os.getenv("RESEND_API_URL", "https://api.resend.com/emails").strip()
 UPLOAD_FOLDER = os.getenv("UPLOAD_FOLDER", "evidence_vault")
 RECIPIENTS_FILE = os.getenv("RECIPIENTS_FILE", "alert_recipients.json")
 SMTP_TIMEOUT_SECONDS = int(os.getenv("SMTP_TIMEOUT_SECONDS", "20"))
@@ -78,6 +85,12 @@ def _smtp_mode() -> str:
     return "auto"
 
 
+def _email_provider() -> str:
+    if EMAIL_PROVIDER in {"smtp", "resend", "auto"}:
+        return EMAIL_PROVIDER
+    return "auto"
+
+
 def _smtp_candidates() -> list[tuple[str, str, int]]:
     host = _smtp_host()
     port = _smtp_port()
@@ -116,7 +129,7 @@ def _smtp_candidates() -> list[tuple[str, str, int]]:
     return unique
 
 
-def _send_message(msg: EmailMessage) -> None:
+def _send_message_smtp(msg: EmailMessage) -> None:
     timeout = _smtp_timeout()
     errors: list[str] = []
 
@@ -145,6 +158,100 @@ def _send_message(msg: EmailMessage) -> None:
             errors.append(f"{transport}@{host}:{port} -> {exc}")
 
     raise RuntimeError("SMTP delivery failed after retries: " + " | ".join(errors))
+
+
+def _resend_config_error() -> Optional[str]:
+    if not RESEND_API_KEY:
+        return "RESEND_API_KEY is missing"
+    if not _is_valid_email(RESEND_FROM):
+        return "RESEND_FROM is missing or invalid"
+    return None
+
+
+def _send_via_resend(
+    subject: str,
+    body: str,
+    recipients: list[str],
+    attachment_path: Optional[str] = None,
+) -> None:
+    config_error = _resend_config_error()
+    if config_error:
+        raise ValueError(config_error)
+    if not recipients:
+        raise ValueError("No recipient email configured")
+
+    payload: dict = {
+        "from": RESEND_FROM,
+        "to": recipients,
+        "subject": subject,
+        "text": body,
+    }
+
+    if attachment_path:
+        with open(attachment_path, "rb") as f:
+            b64 = base64.b64encode(f.read()).decode("ascii")
+        payload["attachments"] = [
+            {"filename": os.path.basename(attachment_path), "content": b64}
+        ]
+
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        RESEND_API_URL,
+        data=data,
+        method="POST",
+        headers={
+            "Authorization": f"Bearer {RESEND_API_KEY}",
+            "Content-Type": "application/json",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=_smtp_timeout()) as _:
+            return
+    except urllib.error.HTTPError as exc:
+        try:
+            detail = exc.read().decode("utf-8", errors="replace")
+        except Exception:
+            detail = str(exc)
+        raise RuntimeError(f"Resend API error: HTTP {exc.code} {detail}") from exc
+    except Exception as exc:
+        raise RuntimeError(f"Resend delivery failed: {exc}") from exc
+
+
+def _send_email(
+    subject: str,
+    body: str,
+    recipients: list[str],
+    attachment_path: Optional[str] = None,
+) -> None:
+    provider = _email_provider()
+    msg = EmailMessage()
+    msg["Subject"] = subject
+    msg["From"] = _smtp_email()
+    msg["To"] = ", ".join(recipients)
+    msg.set_content(body)
+    if attachment_path:
+        with open(attachment_path, "rb") as file:
+            msg.add_attachment(
+                file.read(),
+                maintype="image",
+                subtype="jpeg",
+                filename=os.path.basename(attachment_path),
+            )
+
+    if provider == "resend":
+        _send_via_resend(subject, body, recipients, attachment_path)
+        return
+
+    if provider == "smtp":
+        _send_message_smtp(msg)
+        return
+
+    # auto: prefer Resend if configured, else SMTP
+    if RESEND_API_KEY and _is_valid_email(RESEND_FROM):
+        _send_via_resend(subject, body, recipients, attachment_path)
+        return
+
+    _send_message_smtp(msg)
 
 
 def prune_evidence_folder(keep: int = MAX_EVIDENCE_TO_KEEP) -> None:
@@ -244,27 +351,13 @@ def _latest_evidence_path() -> Optional[str]:
 
 
 def send_image_email(image_path: str, recipients: list[str], subject: str, body: str) -> None:
-    config_error = _smtp_config_error()
+    config_error = _smtp_config_error() if _email_provider() != "resend" else _resend_config_error()
     if config_error:
         raise ValueError(config_error)
     if not recipients:
         raise ValueError("No recipient email configured")
 
-    msg = EmailMessage()
-    msg["Subject"] = subject
-    msg["From"] = _smtp_email()
-    msg["To"] = ", ".join(recipients)
-    msg.set_content(body)
-
-    with open(image_path, "rb") as file:
-        msg.add_attachment(
-            file.read(),
-            maintype="image",
-            subtype="jpeg",
-            filename=os.path.basename(image_path),
-        )
-
-    _send_message(msg)
+    _send_email(subject, body, recipients, attachment_path=image_path)
 
 
 def send_alert_email(image_path: str, location: str, device_info: str, recipients: list[str]) -> None:
@@ -284,28 +377,25 @@ def send_alert_email(image_path: str, location: str, device_info: str, recipient
 
 
 def send_test_email(recipients: list[str]) -> None:
-    config_error = _smtp_config_error()
+    config_error = _smtp_config_error() if _email_provider() != "resend" else _resend_config_error()
     if config_error:
         raise ValueError(config_error)
     if not recipients:
         raise ValueError("No recipient email configured")
 
-    msg = EmailMessage()
-    msg["Subject"] = "Securax Test Email"
-    msg["From"] = _smtp_email()
-    msg["To"] = ", ".join(recipients)
-    msg.set_content(
+    body = (
         "This is a test email from Securax.\n\n"
         f"Time: {datetime.now().isoformat(timespec='seconds')}\n"
         "If you received this, SMTP and recipient setup are working."
     )
 
-    _send_message(msg)
+    _send_email("Securax Test Email", body, recipients)
 
 
 @app.route("/email_config_status", methods=["GET"])
 def email_config_status():
-    err = _smtp_config_error()
+    provider = _email_provider()
+    err = _resend_config_error() if provider == "resend" else _smtp_config_error()
     smtp_email = _smtp_email()
     smtp_password = _smtp_password()
     return (
@@ -313,11 +403,14 @@ def email_config_status():
             {
                 "status": "ok" if err is None else "invalid",
                 "error": err,
+                "email_provider": provider,
                 "smtp_email_set": bool(smtp_email.strip()) and not _looks_placeholder(smtp_email),
                 "smtp_password_set": bool(smtp_password.strip()) and not _looks_placeholder(smtp_password),
                 "smtp_host": _smtp_host(),
                 "smtp_port": _smtp_port(),
                 "smtp_mode": _smtp_mode(),
+                "resend_api_set": bool(RESEND_API_KEY),
+                "resend_from_set": bool(RESEND_FROM),
                 "recipient_count": len(_effective_recipients()),
             }
         ),
