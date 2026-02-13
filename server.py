@@ -1,5 +1,7 @@
 import os
 import smtplib
+import socket
+import ssl
 from datetime import datetime
 from email.message import EmailMessage
 import uuid
@@ -76,27 +78,73 @@ def _smtp_mode() -> str:
     return "auto"
 
 
-def _send_message(msg: EmailMessage) -> None:
+def _smtp_candidates() -> list[tuple[str, str, int]]:
     host = _smtp_host()
     port = _smtp_port()
-    timeout = _smtp_timeout()
     mode = _smtp_mode()
+    candidates: list[tuple[str, str, int]] = []
 
-    # Auto mode: prefer SSL on 465, otherwise use STARTTLS.
-    use_ssl = mode == "ssl" or (mode == "auto" and port == 465)
-    if use_ssl:
-        with smtplib.SMTP_SSL(host, port, timeout=timeout) as smtp:
-            smtp.login(_smtp_email(), _smtp_password())
-            smtp.send_message(msg)
-        return
+    if mode == "ssl":
+        candidates.append(("ssl", host, port))
+        if port != 465:
+            candidates.append(("ssl", host, 465))
+    elif mode == "starttls":
+        candidates.append(("starttls", host, port))
+        if port != 587:
+            candidates.append(("starttls", host, 587))
+    elif mode == "plain":
+        candidates.append(("plain", host, port))
+    else:
+        # Auto mode tries the configured endpoint first, then common Gmail fallbacks.
+        if port == 465:
+            candidates.extend(
+                [("ssl", host, 465), ("starttls", host, 587), ("ssl", host, port)]
+            )
+        else:
+            candidates.extend(
+                [("starttls", host, port), ("starttls", host, 587), ("ssl", host, 465)]
+            )
 
-    with smtplib.SMTP(host, port, timeout=timeout) as smtp:
-        if mode in {"starttls", "auto"}:
-            smtp.ehlo()
-            smtp.starttls()
-            smtp.ehlo()
-        smtp.login(_smtp_email(), _smtp_password())
-        smtp.send_message(msg)
+    # Preserve order while removing duplicates.
+    seen = set()
+    unique: list[tuple[str, str, int]] = []
+    for item in candidates:
+        if item in seen:
+            continue
+        seen.add(item)
+        unique.append(item)
+    return unique
+
+
+def _send_message(msg: EmailMessage) -> None:
+    timeout = _smtp_timeout()
+    errors: list[str] = []
+
+    for transport, host, port in _smtp_candidates():
+        try:
+            if transport == "ssl":
+                with smtplib.SMTP_SSL(host, port, timeout=timeout) as smtp:
+                    smtp.login(_smtp_email(), _smtp_password())
+                    smtp.send_message(msg)
+                return
+
+            with smtplib.SMTP(host, port, timeout=timeout) as smtp:
+                if transport == "starttls":
+                    smtp.ehlo()
+                    smtp.starttls(context=ssl.create_default_context())
+                    smtp.ehlo()
+                smtp.login(_smtp_email(), _smtp_password())
+                smtp.send_message(msg)
+            return
+        except (
+            smtplib.SMTPException,
+            TimeoutError,
+            socket.timeout,
+            OSError,
+        ) as exc:
+            errors.append(f"{transport}@{host}:{port} -> {exc}")
+
+    raise RuntimeError("SMTP delivery failed after retries: " + " | ".join(errors))
 
 
 def prune_evidence_folder(keep: int = MAX_EVIDENCE_TO_KEEP) -> None:
