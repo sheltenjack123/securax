@@ -17,6 +17,7 @@ SMTP_EMAIL = os.getenv("SMTP_EMAIL", "")
 SMTP_PASSWORD = os.getenv("SMTP_PASSWORD", "")
 SMTP_HOST = os.getenv("SMTP_HOST", "smtp.gmail.com")
 SMTP_PORT = int(os.getenv("SMTP_PORT", "465"))
+SMTP_MODE = os.getenv("SMTP_MODE", "auto").strip().lower()
 UPLOAD_FOLDER = os.getenv("UPLOAD_FOLDER", "evidence_vault")
 RECIPIENTS_FILE = os.getenv("RECIPIENTS_FILE", "alert_recipients.json")
 SMTP_TIMEOUT_SECONDS = int(os.getenv("SMTP_TIMEOUT_SECONDS", "20"))
@@ -67,6 +68,35 @@ def _smtp_port() -> int:
 
 def _smtp_timeout() -> int:
     return SMTP_TIMEOUT_SECONDS if SMTP_TIMEOUT_SECONDS > 0 else 20
+
+
+def _smtp_mode() -> str:
+    if SMTP_MODE in {"ssl", "starttls", "plain", "auto"}:
+        return SMTP_MODE
+    return "auto"
+
+
+def _send_message(msg: EmailMessage) -> None:
+    host = _smtp_host()
+    port = _smtp_port()
+    timeout = _smtp_timeout()
+    mode = _smtp_mode()
+
+    # Auto mode: prefer SSL on 465, otherwise use STARTTLS.
+    use_ssl = mode == "ssl" or (mode == "auto" and port == 465)
+    if use_ssl:
+        with smtplib.SMTP_SSL(host, port, timeout=timeout) as smtp:
+            smtp.login(_smtp_email(), _smtp_password())
+            smtp.send_message(msg)
+        return
+
+    with smtplib.SMTP(host, port, timeout=timeout) as smtp:
+        if mode in {"starttls", "auto"}:
+            smtp.ehlo()
+            smtp.starttls()
+            smtp.ehlo()
+        smtp.login(_smtp_email(), _smtp_password())
+        smtp.send_message(msg)
 
 
 def prune_evidence_folder(keep: int = MAX_EVIDENCE_TO_KEEP) -> None:
@@ -186,9 +216,7 @@ def send_image_email(image_path: str, recipients: list[str], subject: str, body:
             filename=os.path.basename(image_path),
         )
 
-    with smtplib.SMTP_SSL(_smtp_host(), _smtp_port(), timeout=_smtp_timeout()) as smtp:
-        smtp.login(_smtp_email(), _smtp_password())
-        smtp.send_message(msg)
+    _send_message(msg)
 
 
 def send_alert_email(image_path: str, location: str, device_info: str, recipients: list[str]) -> None:
@@ -224,9 +252,7 @@ def send_test_email(recipients: list[str]) -> None:
         "If you received this, SMTP and recipient setup are working."
     )
 
-    with smtplib.SMTP_SSL(_smtp_host(), _smtp_port(), timeout=_smtp_timeout()) as smtp:
-        smtp.login(_smtp_email(), _smtp_password())
-        smtp.send_message(msg)
+    _send_message(msg)
 
 
 @app.route("/email_config_status", methods=["GET"])
@@ -243,6 +269,7 @@ def email_config_status():
                 "smtp_password_set": bool(smtp_password.strip()) and not _looks_placeholder(smtp_password),
                 "smtp_host": _smtp_host(),
                 "smtp_port": _smtp_port(),
+                "smtp_mode": _smtp_mode(),
                 "recipient_count": len(_effective_recipients()),
             }
         ),
