@@ -19,11 +19,13 @@ SMTP_HOST = os.getenv("SMTP_HOST", "smtp.gmail.com")
 SMTP_PORT = int(os.getenv("SMTP_PORT", "465"))
 UPLOAD_FOLDER = os.getenv("UPLOAD_FOLDER", "evidence_vault")
 RECIPIENTS_FILE = os.getenv("RECIPIENTS_FILE", "alert_recipients.json")
+SMTP_TIMEOUT_SECONDS = int(os.getenv("SMTP_TIMEOUT_SECONDS", "20"))
 
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
 MAX_EVIDENCE_TO_KEEP = int(os.getenv("MAX_EVIDENCE_TO_KEEP", "10"))
 EMAIL_PATTERN = re.compile(r"^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$")
+
 
 def _looks_placeholder(value: str) -> bool:
     lower = (value or "").strip().lower()
@@ -61,6 +63,10 @@ def _smtp_port() -> int:
         return int(SMTP_PORT)
     except Exception:
         return 465
+
+
+def _smtp_timeout() -> int:
+    return SMTP_TIMEOUT_SECONDS if SMTP_TIMEOUT_SECONDS > 0 else 20
 
 
 def prune_evidence_folder(keep: int = MAX_EVIDENCE_TO_KEEP) -> None:
@@ -180,7 +186,7 @@ def send_image_email(image_path: str, recipients: list[str], subject: str, body:
             filename=os.path.basename(image_path),
         )
 
-    with smtplib.SMTP_SSL(_smtp_host(), _smtp_port()) as smtp:
+    with smtplib.SMTP_SSL(_smtp_host(), _smtp_port(), timeout=_smtp_timeout()) as smtp:
         smtp.login(_smtp_email(), _smtp_password())
         smtp.send_message(msg)
 
@@ -218,7 +224,7 @@ def send_test_email(recipients: list[str]) -> None:
         "If you received this, SMTP and recipient setup are working."
     )
 
-    with smtplib.SMTP_SSL(_smtp_host(), _smtp_port()) as smtp:
+    with smtplib.SMTP_SSL(_smtp_host(), _smtp_port(), timeout=_smtp_timeout()) as smtp:
         smtp.login(_smtp_email(), _smtp_password())
         smtp.send_message(msg)
 
