@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+evidence_vault/
+alert_recipients.json
+smtp_config.json
+logs/
