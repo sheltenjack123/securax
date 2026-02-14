@@ -2,15 +2,12 @@ import os
 import smtplib
 import socket
 import ssl
-import base64
 from datetime import datetime
 from email.message import EmailMessage
 import uuid
 import re
 import json
 from typing import Optional
-import urllib.request
-import urllib.error
 
 from flask import Flask, jsonify, request, send_from_directory, url_for
 
@@ -23,18 +20,34 @@ SMTP_PASSWORD = os.getenv("SMTP_PASSWORD", "")
 SMTP_HOST = os.getenv("SMTP_HOST", "smtp.gmail.com")
 SMTP_PORT = int(os.getenv("SMTP_PORT", "465"))
 SMTP_MODE = os.getenv("SMTP_MODE", "auto").strip().lower()
-EMAIL_PROVIDER = os.getenv("EMAIL_PROVIDER", "auto").strip().lower()
-RESEND_API_KEY = os.getenv("RESEND_API_KEY", "").strip()
-RESEND_FROM = os.getenv("RESEND_FROM", "").strip()
-RESEND_API_URL = os.getenv("RESEND_API_URL", "https://api.resend.com/emails").strip()
 UPLOAD_FOLDER = os.getenv("UPLOAD_FOLDER", "evidence_vault")
 RECIPIENTS_FILE = os.getenv("RECIPIENTS_FILE", "alert_recipients.json")
+SMTP_CONFIG_FILE = os.getenv("SMTP_CONFIG_FILE", "smtp_config.json")
 SMTP_TIMEOUT_SECONDS = int(os.getenv("SMTP_TIMEOUT_SECONDS", "20"))
 
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
 MAX_EVIDENCE_TO_KEEP = int(os.getenv("MAX_EVIDENCE_TO_KEEP", "10"))
 EMAIL_PATTERN = re.compile(r"^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$")
+
+
+def _load_smtp_config() -> dict:
+    try:
+        if not os.path.exists(SMTP_CONFIG_FILE):
+            return {}
+        with open(SMTP_CONFIG_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _config_value(key: str, fallback: str) -> str:
+    file_cfg = _load_smtp_config()
+    raw = file_cfg.get(key)
+    if raw is None:
+        return fallback
+    return str(raw).strip()
 
 
 def _looks_placeholder(value: str) -> bool:
@@ -52,27 +65,28 @@ def _looks_placeholder(value: str) -> bool:
 
 
 def _owner_email() -> str:
-    return OWNER_EMAIL.strip()
+    return _config_value("OWNER_EMAIL", OWNER_EMAIL)
 
 
 def _smtp_email() -> str:
-    return SMTP_EMAIL.strip()
+    return _config_value("SMTP_EMAIL", SMTP_EMAIL)
 
 
 def _smtp_password() -> str:
-    return SMTP_PASSWORD.strip()
+    return _config_value("SMTP_PASSWORD", SMTP_PASSWORD)
 
 
 def _smtp_host() -> str:
-    value = SMTP_HOST
+    value = _config_value("SMTP_HOST", SMTP_HOST)
     return value or "smtp.gmail.com"
 
 
 def _smtp_port() -> int:
+    value = _config_value("SMTP_PORT", str(SMTP_PORT))
     try:
-        return int(SMTP_PORT)
+        return int(value)
     except Exception:
-        return 465
+        return SMTP_PORT
 
 
 def _smtp_timeout() -> int:
@@ -82,12 +96,6 @@ def _smtp_timeout() -> int:
 def _smtp_mode() -> str:
     if SMTP_MODE in {"ssl", "starttls", "plain", "auto"}:
         return SMTP_MODE
-    return "auto"
-
-
-def _email_provider() -> str:
-    if EMAIL_PROVIDER in {"smtp", "resend", "auto"}:
-        return EMAIL_PROVIDER
     return "auto"
 
 
@@ -108,7 +116,6 @@ def _smtp_candidates() -> list[tuple[str, str, int]]:
     elif mode == "plain":
         candidates.append(("plain", host, port))
     else:
-        # Auto mode tries the configured endpoint first, then common Gmail fallbacks.
         if port == 465:
             candidates.extend(
                 [("ssl", host, 465), ("starttls", host, 587), ("ssl", host, port)]
@@ -118,7 +125,6 @@ def _smtp_candidates() -> list[tuple[str, str, int]]:
                 [("starttls", host, port), ("starttls", host, 587), ("ssl", host, 465)]
             )
 
-    # Preserve order while removing duplicates.
     seen = set()
     unique: list[tuple[str, str, int]] = []
     for item in candidates:
@@ -127,131 +133,6 @@ def _smtp_candidates() -> list[tuple[str, str, int]]:
         seen.add(item)
         unique.append(item)
     return unique
-
-
-def _send_message_smtp(msg: EmailMessage) -> None:
-    timeout = _smtp_timeout()
-    errors: list[str] = []
-
-    for transport, host, port in _smtp_candidates():
-        try:
-            if transport == "ssl":
-                with smtplib.SMTP_SSL(host, port, timeout=timeout) as smtp:
-                    smtp.login(_smtp_email(), _smtp_password())
-                    smtp.send_message(msg)
-                return
-
-            with smtplib.SMTP(host, port, timeout=timeout) as smtp:
-                if transport == "starttls":
-                    smtp.ehlo()
-                    smtp.starttls(context=ssl.create_default_context())
-                    smtp.ehlo()
-                smtp.login(_smtp_email(), _smtp_password())
-                smtp.send_message(msg)
-            return
-        except (
-            smtplib.SMTPException,
-            TimeoutError,
-            socket.timeout,
-            OSError,
-        ) as exc:
-            errors.append(f"{transport}@{host}:{port} -> {exc}")
-
-    raise RuntimeError("SMTP delivery failed after retries: " + " | ".join(errors))
-
-
-def _resend_config_error() -> Optional[str]:
-    if not RESEND_API_KEY:
-        return "RESEND_API_KEY is missing"
-    if not _is_valid_email(RESEND_FROM):
-        return "RESEND_FROM is missing or invalid"
-    return None
-
-
-def _send_via_resend(
-    subject: str,
-    body: str,
-    recipients: list[str],
-    attachment_path: Optional[str] = None,
-) -> None:
-    config_error = _resend_config_error()
-    if config_error:
-        raise ValueError(config_error)
-    if not recipients:
-        raise ValueError("No recipient email configured")
-
-    payload: dict = {
-        "from": RESEND_FROM,
-        "to": recipients,
-        "subject": subject,
-        "text": body,
-    }
-
-    if attachment_path:
-        with open(attachment_path, "rb") as f:
-            b64 = base64.b64encode(f.read()).decode("ascii")
-        payload["attachments"] = [
-            {"filename": os.path.basename(attachment_path), "content": b64}
-        ]
-
-    data = json.dumps(payload).encode("utf-8")
-    req = urllib.request.Request(
-        RESEND_API_URL,
-        data=data,
-        method="POST",
-        headers={
-            "Authorization": f"Bearer {RESEND_API_KEY}",
-            "Content-Type": "application/json",
-        },
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=_smtp_timeout()) as _:
-            return
-    except urllib.error.HTTPError as exc:
-        try:
-            detail = exc.read().decode("utf-8", errors="replace")
-        except Exception:
-            detail = str(exc)
-        raise RuntimeError(f"Resend API error: HTTP {exc.code} {detail}") from exc
-    except Exception as exc:
-        raise RuntimeError(f"Resend delivery failed: {exc}") from exc
-
-
-def _send_email(
-    subject: str,
-    body: str,
-    recipients: list[str],
-    attachment_path: Optional[str] = None,
-) -> None:
-    provider = _email_provider()
-    msg = EmailMessage()
-    msg["Subject"] = subject
-    msg["From"] = _smtp_email()
-    msg["To"] = ", ".join(recipients)
-    msg.set_content(body)
-    if attachment_path:
-        with open(attachment_path, "rb") as file:
-            msg.add_attachment(
-                file.read(),
-                maintype="image",
-                subtype="jpeg",
-                filename=os.path.basename(attachment_path),
-            )
-
-    if provider == "resend":
-        _send_via_resend(subject, body, recipients, attachment_path)
-        return
-
-    if provider == "smtp":
-        _send_message_smtp(msg)
-        return
-
-    # auto: prefer Resend if configured, else SMTP
-    if RESEND_API_KEY and _is_valid_email(RESEND_FROM):
-        _send_via_resend(subject, body, recipients, attachment_path)
-        return
-
-    _send_message_smtp(msg)
 
 
 def prune_evidence_folder(keep: int = MAX_EVIDENCE_TO_KEEP) -> None:
@@ -351,13 +232,27 @@ def _latest_evidence_path() -> Optional[str]:
 
 
 def send_image_email(image_path: str, recipients: list[str], subject: str, body: str) -> None:
-    config_error = _smtp_config_error() if _email_provider() != "resend" else _resend_config_error()
+    config_error = _smtp_config_error()
     if config_error:
         raise ValueError(config_error)
     if not recipients:
         raise ValueError("No recipient email configured")
 
-    _send_email(subject, body, recipients, attachment_path=image_path)
+    msg = EmailMessage()
+    msg["Subject"] = subject
+    msg["From"] = _smtp_email()
+    msg["To"] = ", ".join(recipients)
+    msg.set_content(body)
+
+    with open(image_path, "rb") as file:
+        msg.add_attachment(
+            file.read(),
+            maintype="image",
+            subtype="jpeg",
+            filename=os.path.basename(image_path),
+        )
+
+    _send_message(msg)
 
 
 def send_alert_email(image_path: str, location: str, device_info: str, recipients: list[str]) -> None:
@@ -377,25 +272,59 @@ def send_alert_email(image_path: str, location: str, device_info: str, recipient
 
 
 def send_test_email(recipients: list[str]) -> None:
-    config_error = _smtp_config_error() if _email_provider() != "resend" else _resend_config_error()
+    config_error = _smtp_config_error()
     if config_error:
         raise ValueError(config_error)
     if not recipients:
         raise ValueError("No recipient email configured")
 
-    body = (
+    msg = EmailMessage()
+    msg["Subject"] = "Securax Test Email"
+    msg["From"] = _smtp_email()
+    msg["To"] = ", ".join(recipients)
+    msg.set_content(
         "This is a test email from Securax.\n\n"
         f"Time: {datetime.now().isoformat(timespec='seconds')}\n"
         "If you received this, SMTP and recipient setup are working."
     )
 
-    _send_email("Securax Test Email", body, recipients)
+    _send_message(msg)
+
+
+def _send_message(msg: EmailMessage) -> None:
+    timeout = _smtp_timeout()
+    errors: list[str] = []
+
+    for transport, host, port in _smtp_candidates():
+        try:
+            if transport == "ssl":
+                with smtplib.SMTP_SSL(host, port, timeout=timeout) as smtp:
+                    smtp.login(_smtp_email(), _smtp_password())
+                    smtp.send_message(msg)
+                return
+
+            with smtplib.SMTP(host, port, timeout=timeout) as smtp:
+                if transport == "starttls":
+                    smtp.ehlo()
+                    smtp.starttls(context=ssl.create_default_context())
+                    smtp.ehlo()
+                smtp.login(_smtp_email(), _smtp_password())
+                smtp.send_message(msg)
+            return
+        except (
+            smtplib.SMTPException,
+            TimeoutError,
+            socket.timeout,
+            OSError,
+        ) as exc:
+            errors.append(f"{transport}@{host}:{port} -> {exc}")
+
+    raise RuntimeError("SMTP delivery failed after retries: " + " | ".join(errors))
 
 
 @app.route("/email_config_status", methods=["GET"])
 def email_config_status():
-    provider = _email_provider()
-    err = _resend_config_error() if provider == "resend" else _smtp_config_error()
+    err = _smtp_config_error()
     smtp_email = _smtp_email()
     smtp_password = _smtp_password()
     return (
@@ -403,14 +332,11 @@ def email_config_status():
             {
                 "status": "ok" if err is None else "invalid",
                 "error": err,
-                "email_provider": provider,
                 "smtp_email_set": bool(smtp_email.strip()) and not _looks_placeholder(smtp_email),
                 "smtp_password_set": bool(smtp_password.strip()) and not _looks_placeholder(smtp_password),
                 "smtp_host": _smtp_host(),
                 "smtp_port": _smtp_port(),
                 "smtp_mode": _smtp_mode(),
-                "resend_api_set": bool(RESEND_API_KEY),
-                "resend_from_set": bool(RESEND_FROM),
                 "recipient_count": len(_effective_recipients()),
             }
         ),

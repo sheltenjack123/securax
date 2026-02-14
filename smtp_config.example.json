@@ -1,0 +1,7 @@
+{
+  "OWNER_EMAIL": "your_target_email@gmail.com",
+  "SMTP_EMAIL": "your_smtp_gmail@gmail.com",
+  "SMTP_PASSWORD": "your_16_char_google_app_password",
+  "SMTP_HOST": "smtp.gmail.com",
+  "SMTP_PORT": 465
+}
