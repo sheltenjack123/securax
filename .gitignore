@@ -4,3 +4,8 @@ evidence_vault/
 alert_recipients.json
 smtp_config.json
 logs/
+.venv/
+build/
+.dart_tool/
+.idea/
+my_app/my_app/

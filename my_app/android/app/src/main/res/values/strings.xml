@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Securax</string>
+    <string name="device_admin_label">Securax Guardian</string>
+    <string name="device_admin_description">Securax needs this to detect wrong passwords.</string>
+</resources>

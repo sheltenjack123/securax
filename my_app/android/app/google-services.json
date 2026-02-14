@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "16999829693",
+    "project_id": "securax-ef2db",
+    "storage_bucket": "securax-ef2db.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:16999829693:android:53376d5964c19916fca7d4",
+        "android_client_info": {
+          "package_name": "com.securax.app"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyDIL8Txaaya6rqjFTGibi4oX6ISgKMqEK4"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}
