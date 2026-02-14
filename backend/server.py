@@ -192,13 +192,7 @@ def _save_recipients(recipients: list[str]) -> None:
 
 
 def _effective_recipients() -> list[str]:
-    recipients = _load_recipients()
-    owner = _owner_email()
-    if _is_valid_email(owner) and not _looks_placeholder(owner):
-        owner_key = owner.strip().lower()
-        if owner_key not in {r.lower() for r in recipients}:
-            recipients.append(owner.strip())
-    return recipients
+    return _load_recipients()
 
 
 def _smtp_config_error() -> Optional[str]:
